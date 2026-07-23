@@ -20,6 +20,8 @@ from openij.protocol import (
     build_get_status,
     build_power_on,
     build_set_job_configuration,
+    build_set_silent_mode,
+    build_start_device_job,
     build_start_job,
     build_test_print,
 )
@@ -59,6 +61,7 @@ class CanonClient:
         self.timeout = timeout
 
         self.path = "/canon/ij/command2/port1"
+
         self.url = (
             f"http://{ip_address}:{port}{self.path}"
             if port != 80
@@ -88,10 +91,7 @@ class CanonClient:
     def _read_chunked_body(
         reader: BinaryIO,
     ) -> bytes:
-        """
-        Décode un corps HTTP utilisant
-        Transfer-Encoding: chunked.
-        """
+        """Décode un corps HTTP utilisant le mode chunked."""
 
         body = bytearray()
 
@@ -109,7 +109,6 @@ class CanonClient:
                 errors="replace",
             ).strip()
 
-            # Les éventuelles extensions suivent un point-virgule.
             size_text = size_line.split(";", 1)[0]
 
             try:
@@ -120,7 +119,6 @@ class CanonClient:
                 ) from error
 
             if chunk_size == 0:
-                # Lecture des éventuels en-têtes de fin.
                 while True:
                     trailer = reader.readline()
 
@@ -136,7 +134,6 @@ class CanonClient:
 
             body.extend(chunk)
 
-            # Chaque bloc est suivi de CRLF.
             ending = CanonClient._read_exactly(
                 reader,
                 2,
@@ -153,12 +150,7 @@ class CanonClient:
     def _read_http_response(
         reader: BinaryIO,
     ) -> tuple[int, dict[str, str], bytes]:
-        """
-        Lit une réponse HTTP complète.
-
-        Prend notamment en charge le transfert chunked
-        utilisé par les imprimantes Canon.
-        """
+        """Lit une réponse HTTP complète."""
 
         status_line_bytes = reader.readline()
 
@@ -278,19 +270,16 @@ class CanonClient:
         xml: str,
     ) -> CanonResponse:
         """
-        Envoie une commande Canon sur une connexion TCP
-        déjà ouverte.
+        Envoie une commande sur une connexion TCP déjà ouverte.
 
-        Le POST et le GET utilisent impérativement
-        la même connexion.
+        Le POST et le GET associés utilisent la même connexion.
         """
 
         xml_data = xml.encode("utf-8")
 
-        post_request = self._build_post_request(xml_data)
-        get_request = self._build_get_request()
-
-        sock.sendall(post_request)
+        sock.sendall(
+            self._build_post_request(xml_data)
+        )
 
         (
             post_status,
@@ -300,11 +289,12 @@ class CanonClient:
 
         if post_status != 200:
             raise ConnectionError(
-                "Le POST Canon a retourné "
-                f"HTTP {post_status}."
+                f"Le POST Canon a retourné HTTP {post_status}."
             )
 
-        sock.sendall(get_request)
+        sock.sendall(
+            self._build_get_request()
+        )
 
         (
             get_status,
@@ -314,8 +304,7 @@ class CanonClient:
 
         if get_status != 200:
             raise ConnectionError(
-                "Le GET Canon a retourné "
-                f"HTTP {get_status}."
+                f"Le GET Canon a retourné HTTP {get_status}."
             )
 
         if not get_body:
@@ -340,12 +329,7 @@ class CanonClient:
         )
 
     def send_command(self, xml: str) -> CanonResponse:
-        """
-        Envoie une commande Canon isolée.
-
-        Une même connexion TCP est utilisée pour le POST
-        et le GET associés à cette commande.
-        """
+        """Envoie une commande Canon isolée."""
 
         try:
             with socket.create_connection(
@@ -452,7 +436,7 @@ class CanonClient:
         )
 
     def power_on(self) -> CanonResponse:
-        """Envoie la commande de réveil Canon."""
+        """Réveille l'imprimante."""
 
         response = self.send_command(
             build_power_on()
@@ -470,12 +454,7 @@ class CanonClient:
         attempts: int = 20,
         delay: float = 1.0,
     ) -> None:
-        """
-        Vérifie si l'imprimante est réveillée.
-
-        Lorsqu'elle répond Suspended, OpenIJ envoie PowerOn
-        puis surveille son réveil.
-        """
+        """Réveille l'imprimante lorsqu'elle est suspendue."""
 
         status = self.get_status(
             service_type="print"
@@ -533,24 +512,127 @@ class CanonClient:
             f"({last_detail or 'aucun détail'})."
         )
 
+    def set_quiet_mode(
+        self,
+        enabled: bool,
+        job_id: str = "00000002",
+    ) -> CanonResponse:
+        """
+        Active ou désactive le mode silencieux.
+
+        Toutes les commandes utilisent la même connexion TCP :
+
+        1. StartJob / device
+        2. SetConfiguration / silentmode
+        3. EndJob / device
+        """
+
+        self.ensure_awake()
+
+        configuration_response: CanonResponse | None = None
+        job_started = False
+
+        try:
+            with socket.create_connection(
+                (self.ip_address, self.port),
+                timeout=self.timeout,
+            ) as sock:
+
+                sock.settimeout(self.timeout)
+
+                with sock.makefile("rb") as reader:
+                    try:
+                        start_response = (
+                            self._send_command_on_connection(
+                                sock,
+                                reader,
+                                build_start_device_job(job_id),
+                            )
+                        )
+
+                        self._check_canon_response(
+                            start_response,
+                            "StartJobResponse",
+                        )
+
+                        job_started = True
+
+                        configuration_response = (
+                            self._send_command_on_connection(
+                                sock,
+                                reader,
+                                build_set_silent_mode(
+                                    job_id=job_id,
+                                    enabled=enabled,
+                                ),
+                            )
+                        )
+
+                        self._check_canon_response(
+                            configuration_response,
+                            "SetConfigurationResponse",
+                        )
+
+                    except Exception:
+                        if job_started:
+                            try:
+                                self._send_command_on_connection(
+                                    sock,
+                                    reader,
+                                    build_end_job(
+                                        job_id,
+                                        service_type="device",
+                                    ),
+                                )
+                            except Exception:
+                                pass
+
+                        raise
+
+                    else:
+                        end_response = (
+                            self._send_command_on_connection(
+                                sock,
+                                reader,
+                                build_end_job(
+                                    job_id,
+                                    service_type="device",
+                                ),
+                            )
+                        )
+
+                        self._check_canon_response(
+                            end_response,
+                            "EndJobResponse",
+                        )
+
+        except socket.timeout as error:
+            raise ConnectionError(
+                "Délai de communication dépassé "
+                "pendant la configuration."
+            ) from error
+
+        except OSError as error:
+            raise ConnectionError(
+                "Erreur réseau pendant la configuration : "
+                f"{error}"
+            ) from error
+
+        if configuration_response is None:
+            raise ConnectionError(
+                "La configuration du mode silencieux "
+                "n'a retourné aucune réponse."
+            )
+
+        return configuration_response
+
     def automatic_head_alignment(
         self,
         job_id: str = "00000002",
         username: str | None = None,
         computer_name: str | None = None,
     ) -> MaintenanceJobResult:
-        """
-        Lance l'alignement automatique de la tête.
-
-        Toutes les commandes du travail de maintenance
-        utilisent la même connexion TCP :
-
-        1. StartJob
-        2. SetJobConfiguration
-        3. TestPrint / half_auto_registration
-        4. GetStatus
-        5. EndJob
-        """
+        """Lance l'alignement automatique de la tête."""
 
         if username is None:
             username = getpass.getuser()
@@ -641,8 +723,6 @@ class CanonClient:
                         )
 
                     except Exception:
-                        # Une erreur pendant EndJob ne doit pas
-                        # masquer l'erreur principale.
                         if job_started:
                             try:
                                 self._send_command_on_connection(
